@@ -4,6 +4,7 @@ import pandas as pd
 import re
 import requests
 from urllib.parse import urlparse, parse_qs
+from geopy.geocoders import Nominatim
 
 # -------------------------------------------
 # 1. ページ設定
@@ -15,53 +16,63 @@ st.set_page_config(
 )
 
 # -------------------------------------------
-# 2. 座標抽出ロジック (URL対応)
+# 2. 座標抽出ロジック (URL・住所対応)
 # -------------------------------------------
 def extract_coords_from_input(user_input):
     """
-    入力文字列（座標またはGoogleMap URL）から緯度経度を抽出する
+    入力文字列（座標、URL、住所）から緯度経度を抽出する
     """
     user_input = user_input.strip()
 
     # パターンA: 直接座標入力 "35.6117, 140.1132"
     try:
-        if ',' in user_input and 'http' not in user_input:
-            lat_str, lon_str = user_input.split(',')
-            return float(lat_str), float(lon_str)
+        if ',' in user_input and 'http' not in user_input and not any(c in user_input for c in "都道府県市区町村"):
+            parts = user_input.split(',')
+            # 数字かどうか確認
+            return float(parts[0]), float(parts[1])
     except:
         pass
 
     # パターンB: URL入力
     if 'http' in user_input:
         try:
-            # 短縮URLの展開 (maps.app.goo.glなど)
             response = requests.get(user_input, allow_redirects=True, timeout=5)
             final_url = response.url
             
-            # 正規表現で @lat,lon,z パターンを探す
-            # 例: .../maps/place/.../@35.611781,140.11325,17z/...
+            # @lat,lon パターン
             match = re.search(r'@(-?\d+\.\d+),(-?\d+\.\d+)', final_url)
-            if match:
-                return float(match.group(1)), float(match.group(2))
+            if match: return float(match.group(1)), float(match.group(2))
             
-            # クエリパラメータ ?q=lat,lon パターンを探す
+            # ?q=lat,lon パターン
             parsed = urlparse(final_url)
             qs = parse_qs(parsed.query)
             if 'q' in qs:
-                # q=35.6117,140.1132 の形式
                 coords = qs['q'][0].split(',')
-                if len(coords) >= 2:
-                    return float(coords[0]), float(coords[1])
+                if len(coords) >= 2: return float(coords[0]), float(coords[1])
                     
-            # 3dパラメータ !3d35.6117!4d140.1132 パターンを探す
+            # !3d !4d パターン
             lat_match = re.search(r'!3d(-?\d+\.\d+)', final_url)
             lon_match = re.search(r'!4d(-?\d+\.\d+)', final_url)
             if lat_match and lon_match:
                 return float(lat_match.group(1)), float(lon_match.group(1))
-
         except Exception as e:
-            st.warning(f"URL解析中にエラーが発生しました: {e}")
+            st.warning(f"URL解析エラー: {e}")
             return None
+
+    # パターンC: 日本語住所入力 (Geopyを使用)
+    try:
+        # 無料の住所検索サービス(Nominatim)を利用
+        geolocator = Nominatim(user_agent="scooter_port_scorer_app")
+        location = geolocator.geocode(user_input)
+        if location:
+            st.success(f"住所が見つかりました: {location.address}")
+            return location.latitude, location.longitude
+        else:
+            st.warning("住所が見つかりませんでした。より詳細な住所か、座標を入力してください。")
+            return None
+    except Exception as e:
+        st.warning(f"住所検索エラー: {e}")
+        return None
 
     return None
 
@@ -162,18 +173,21 @@ def assess_visibility_rank_v2(lat, lon):
 # -------------------------------------------
 st.title("🛴 ポート視認性・需要判定AI")
 st.markdown("""
-Googleマップの **URL** または **座標** を貼り付けるだけで、その場所のポテンシャルを診断します。
+以下のいずれかを入力して、ポート候補地のポテンシャルを診断します。
+* **Google Map URL** (短縮URLも可)
+* **緯度, 経度** (例: 35.611, 140.113)
+* **住所** (例: 千葉県千葉市中央区...)
 """)
 
 # 入力フォーム
 user_input = st.text_input(
     "場所の情報を入力", 
-    placeholder="https://maps.app.goo.gl/... または 35.611, 140.113"
+    placeholder="https://maps.app.goo.gl/... または 千葉県千葉市..."
 )
 
 if st.button("判定開始", type="primary"):
     if not user_input:
-        st.error("URLまたは座標を入力してください")
+        st.error("入力してください")
     else:
         # 1. 入力値の解析
         coords = extract_coords_from_input(user_input)
@@ -204,4 +218,4 @@ if st.button("判定開始", type="primary"):
                 for item in details:
                     st.markdown(item)
         else:
-            st.error("座標を読み取れませんでした。正しいGoogleマップのURLか、座標を入力してください。")
+            st.error("場所を特定できませんでした。正しいURL、座標、または住所を入力してください。")
