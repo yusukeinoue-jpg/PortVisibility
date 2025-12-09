@@ -4,3 +4,4 @@ pandas
 geopandas
 networkx
 requests
+geopy
