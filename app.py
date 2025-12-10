@@ -1,12 +1,3 @@
-ご指摘ありがとうございます。おっしゃる通り、無料の住所検索API（Nominatim）は連続アクセス制限（レートリミット）が厳しく、**CSVで大量のデータを一括処理するとエラーやタイムアウトになりやすい**という弱点があります。
-
-業務利用で安定させるため、**一括判定モードの説明から「住所」を削除**し、**「座標」または「URL」のみを推奨**する形にUIを修正した最新コードを作成しました。
-
-以下のコードで `app.py` を上書きしてください。
-
-### 🔄 修正版 `app.py` (一括判定は座標/URL推奨版)
-
-```python
 import streamlit as st
 import osmnx as ox
 import pandas as pd
@@ -68,7 +59,6 @@ def extract_coords_from_input(user_input):
             return None
 
     # パターンC: 日本語住所入力 (単一検索用)
-    # ※一括処理で大量に呼ぶとエラーになる可能性があるが、機能自体は残しておく
     try:
         geolocator = Nominatim(user_agent="scooter_port_scorer_app")
         location = geolocator.geocode(user_input)
@@ -297,4 +287,3 @@ with tab2:
                 file_name="scooter_ai_results.csv",
                 mime="text/csv",
             )
-```
