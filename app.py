@@ -4,6 +4,7 @@ import pandas as pd
 import re
 import requests
 from urllib.parse import urlparse, parse_qs
+from geopy.geocoders import Nominatim
 
 # -------------------------------------------
 # 1. ページ設定
@@ -15,53 +16,58 @@ st.set_page_config(
 )
 
 # -------------------------------------------
-# 2. 座標抽出ロジック (URL対応)
+# 2. 座標抽出ロジック (URL・住所対応)
 # -------------------------------------------
 def extract_coords_from_input(user_input):
     """
-    入力文字列（座標またはGoogleMap URL）から緯度経度を抽出する
+    入力文字列（座標、URL、住所）から緯度経度を抽出する
     """
     user_input = user_input.strip()
 
-    # パターンA: 直接座標入力 "35.6117, 140.1132"
+    # パターンA: 直接座標入力
     try:
-        if ',' in user_input and 'http' not in user_input:
-            lat_str, lon_str = user_input.split(',')
-            return float(lat_str), float(lon_str)
+        if ',' in user_input and 'http' not in user_input and not any(c in user_input for c in "都道府県市区町村"):
+            parts = user_input.split(',')
+            return float(parts[0]), float(parts[1])
     except:
         pass
 
     # パターンB: URL入力
     if 'http' in user_input:
         try:
-            # 短縮URLの展開 (maps.app.goo.glなど)
             response = requests.get(user_input, allow_redirects=True, timeout=5)
             final_url = response.url
             
-            # 正規表現で @lat,lon,z パターンを探す
-            # 例: .../maps/place/.../@35.611781,140.11325,17z/...
             match = re.search(r'@(-?\d+\.\d+),(-?\d+\.\d+)', final_url)
-            if match:
-                return float(match.group(1)), float(match.group(2))
+            if match: return float(match.group(1)), float(match.group(2))
             
-            # クエリパラメータ ?q=lat,lon パターンを探す
             parsed = urlparse(final_url)
             qs = parse_qs(parsed.query)
             if 'q' in qs:
-                # q=35.6117,140.1132 の形式
                 coords = qs['q'][0].split(',')
-                if len(coords) >= 2:
-                    return float(coords[0]), float(coords[1])
+                if len(coords) >= 2: return float(coords[0]), float(coords[1])
                     
-            # 3dパラメータ !3d35.6117!4d140.1132 パターンを探す
             lat_match = re.search(r'!3d(-?\d+\.\d+)', final_url)
             lon_match = re.search(r'!4d(-?\d+\.\d+)', final_url)
             if lat_match and lon_match:
                 return float(lat_match.group(1)), float(lon_match.group(1))
-
         except Exception as e:
-            st.warning(f"URL解析中にエラーが発生しました: {e}")
+            st.warning(f"URL解析エラー: {e}")
             return None
+
+    # パターンC: 日本語住所入力
+    try:
+        geolocator = Nominatim(user_agent="scooter_port_scorer_app")
+        location = geolocator.geocode(user_input)
+        if location:
+            st.success(f"住所が見つかりました: {location.address}")
+            return location.latitude, location.longitude
+        else:
+            st.warning("住所が見つかりませんでした。より詳細な住所か、座標を入力してください。")
+            return None
+    except Exception as e:
+        st.warning(f"住所検索エラー: {e}")
+        return None
 
     return None
 
@@ -74,7 +80,7 @@ def assess_visibility_rank_v2(lat, lon):
     score = 0
     details = []
 
-    # Check 1: 駅チカ判定 (徒歩3分/240m)
+    # --- Check 1: 駅チカ判定 (徒歩3分/240m) ---
     tags_station = {'railway': ['station', 'subway_entrance'], 'public_transport': 'station'}
     try:
         stations = ox.features.features_from_point((lat, lon), tags_station, dist=240)
@@ -86,41 +92,68 @@ def assess_visibility_rank_v2(lat, lon):
     except:
         pass
 
-    # Check 2: 道路の種類 (範囲100m)
+    # --- Check 2: 道路の種類 (改良版) ---
     try:
-        G = ox.graph_from_point((lat, lon), dist=100, network_type='all')
-        nearest_edge = ox.distance.nearest_edges(G, lon, lat)
-        edge_data = G.get_edge_data(nearest_edge[0], nearest_edge[1])[0]
+        # まずは全ての種類の道で最寄りを検索（歩道含む）
+        G_all = ox.graph_from_point((lat, lon), dist=100, network_type='all')
+        u, v, key = ox.distance.nearest_edges(G_all, lon, lat)
+        edge_data = G_all.get_edge_data(u, v)[key]
         
         highway = edge_data.get('highway', 'unknown')
         if isinstance(highway, list): highway = highway[0]
 
+        # 判定用リスト
         major_roads = ['motorway', 'trunk', 'primary', 'secondary']
         medium_roads = ['tertiary']
         living_roads = ['residential', 'unclassified', 'living_street']
-        private_roads = ['service']
         non_vehicle = ['pedestrian', 'footway', 'path', 'steps', 'cycleway']
 
-        if highway in major_roads:
+        # 【改良ポイント】もし最寄りが「歩道」だったら、近くに「車道」がないか再チェックする
+        final_highway = highway # デフォルトはそのまま
+        is_sidewalk_of_major = False
+
+        if highway in non_vehicle:
+            try:
+                # 車道ネットワークだけで再検索 (範囲50m)
+                G_drive = ox.graph_from_point((lat, lon), dist=50, network_type='drive')
+                u_d, v_d, key_d = ox.distance.nearest_edges(G_drive, lon, lat)
+                
+                # 距離計算 (簡易的にノード間距離などで判定、あるいはnearest_edgesの戻り値を使う手もあるが、ここでは存在チェックのみ)
+                # 車道の情報を取得
+                edge_data_drive = G_drive.get_edge_data(u_d, v_d)[key_d]
+                highway_drive = edge_data_drive.get('highway', 'unknown')
+                if isinstance(highway_drive, list): highway_drive = highway_drive[0]
+
+                # もし近くに幹線道路があれば、評価をそちらにアップグレード
+                if highway_drive in major_roads or highway_drive in medium_roads:
+                    final_highway = highway_drive
+                    is_sidewalk_of_major = True
+                    details.append(f"ℹ️ 歩道上ですが、すぐ横に **{final_highway}** を検知しました。")
+            except:
+                pass # 近くに車道がなければ歩道判定のまま
+
+        # スコアリング (判定には final_highway を使用)
+        if final_highway in major_roads:
             score += 2
-            details.append(f"✅ **幹線道路沿い** (種別: {highway}) (+2.0点) - 視認性「高」")
-        elif highway in medium_roads:
+            details.append(f"✅ **幹線道路沿い** (種別: {final_highway}) (+2.0点) - 視認性「高」")
+        elif final_highway in medium_roads:
             score += 1
-            details.append(f"✅ **一般道・バス通り** (種別: {highway}) (+1.0点) - 視認性「中」")
-        elif highway in living_roads:
+            details.append(f"✅ **一般道・バス通り** (種別: {final_highway}) (+1.0点) - 視認性「中」")
+        elif final_highway in living_roads:
             score += 0.5
-            details.append(f"🏠 **住宅街・生活道路** (種別: {highway}) (+0.5点) - 視認性「低(住民のみ)」")
-        elif highway in private_roads:
+            details.append(f"🏠 **住宅街・生活道路** (種別: {final_highway}) (+0.5点) - 視認性「低(住民のみ)」")
+        elif highway in ['service']: # 元のhighway判定を使う（敷地内は敷地内）
             service_detail = edge_data.get('service', '')
             details.append(f"⚠️ **敷地内通路・私道** (種別: {highway}/{service_detail}) (0点) - 発見困難")
-        elif highway in non_vehicle:
-            details.append(f"⛔️ **車両進入困難の可能性** (種別: {highway}) (判定外) - 要現地確認")
+        elif highway in non_vehicle and not is_sidewalk_of_major:
+            details.append(f"⛔️ **車両進入困難** (種別: {highway}) (判定外) - 近くに車道なし")
         else:
             details.append(f"・ その他細街路 (種別: {highway}) (0点)")
+
     except Exception as e:
         details.append(f"⚠️ 道路データ取得失敗: {str(e)}")
 
-    # Check 3: 交差点判定 (範囲50m)
+    # --- Check 3: 交差点判定 (範囲50m) ---
     try:
         G_simple = ox.graph_from_point((lat, lon), dist=50, network_type='drive', simplify=True)
         nearest_node = ox.distance.nearest_nodes(G_simple, lon, lat)
@@ -162,35 +195,33 @@ def assess_visibility_rank_v2(lat, lon):
 # -------------------------------------------
 st.title("🛴 ポート視認性・需要判定AI")
 st.markdown("""
-Googleマップの **URL** または **座標** を貼り付けるだけで、その場所のポテンシャルを診断します。
+以下のいずれかを入力して、ポート候補地のポテンシャルを診断します。
+* **Google Map URL** (短縮URLも可)
+* **緯度, 経度** (例: 35.611, 140.113)
+* **住所** (例: 千葉県千葉市中央区...)
 """)
 
-# 入力フォーム
 user_input = st.text_input(
     "場所の情報を入力", 
-    placeholder="https://maps.app.goo.gl/... または 35.611, 140.113"
+    placeholder="https://support.google.com/maps/answer/18539?hl=ja&co=GENIE.Platform%3DDesktop2... または 住所、座標"
 )
 
 if st.button("判定開始", type="primary"):
     if not user_input:
-        st.error("URLまたは座標を入力してください")
+        st.error("入力してください")
     else:
-        # 1. 入力値の解析
         coords = extract_coords_from_input(user_input)
         
         if coords:
             lat, lon = coords
             
-            # 2. 地図表示
             st.markdown("### 📍 判定場所")
             df_map = pd.DataFrame({'lat': [lat], 'lon': [lon]})
             st.map(df_map, zoom=15)
 
-            # 3. 解析実行
             with st.spinner('地図データを解析中...（10〜20秒ほどかかります）'):
                 rank, score, details, color, comment = assess_visibility_rank_v2(lat, lon)
 
-            # 4. 結果表示
             st.divider()
             st.subheader("診断結果")
             col1, col2 = st.columns(2)
@@ -204,4 +235,4 @@ if st.button("判定開始", type="primary"):
                 for item in details:
                     st.markdown(item)
         else:
-            st.error("座標を読み取れませんでした。正しいGoogleマップのURLか、座標を入力してください。")
+            st.error("場所を特定できませんでした。正しいURL、座標、または住所を入力してください。")
