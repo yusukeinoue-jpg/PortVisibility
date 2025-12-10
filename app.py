@@ -276,7 +276,7 @@ with tab1:
 with tab2:
     st.markdown("""
     **CSVファイルをアップロードしてください。** (推奨: URLまたは座標列)
-    ※ 最大5並列で高速処理します。
+    ※ 最大5並列で高速処理します。無料枠なので、一旦は上限20箇所でお願いします。３−４分でCSV出力できると思います。
     """)
     uploaded_file = st.file_uploader("CSVファイルをドラッグ&ドロップ", type="csv")
     if uploaded_file:
