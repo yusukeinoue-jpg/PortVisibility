@@ -1,8 +1,18 @@
+ご指摘ありがとうございます。おっしゃる通り、無料の住所検索API（Nominatim）は連続アクセス制限（レートリミット）が厳しく、**CSVで大量のデータを一括処理するとエラーやタイムアウトになりやすい**という弱点があります。
+
+業務利用で安定させるため、**一括判定モードの説明から「住所」を削除**し、**「座標」または「URL」のみを推奨**する形にUIを修正した最新コードを作成しました。
+
+以下のコードで `app.py` を上書きしてください。
+
+### 🔄 修正版 `app.py` (一括判定は座標/URL推奨版)
+
+```python
 import streamlit as st
 import osmnx as ox
 import pandas as pd
 import re
 import requests
+import time
 from urllib.parse import urlparse, parse_qs
 from geopy.geocoders import Nominatim
 
@@ -11,17 +21,20 @@ from geopy.geocoders import Nominatim
 # -------------------------------------------
 st.set_page_config(
     page_title="Scooter Port Visibility Scorer", 
-    layout="centered",
+    layout="wide",
     initial_sidebar_state="collapsed"
 )
 
 # -------------------------------------------
-# 2. 座標抽出ロジック (URL・住所対応)
+# 2. 座標抽出ロジック
 # -------------------------------------------
 def extract_coords_from_input(user_input):
     """
     入力文字列（座標、URL、住所）から緯度経度を抽出する
     """
+    if not isinstance(user_input, str):
+        return None
+        
     user_input = user_input.strip()
 
     # パターンA: 直接座標入力
@@ -51,22 +64,17 @@ def extract_coords_from_input(user_input):
             lon_match = re.search(r'!4d(-?\d+\.\d+)', final_url)
             if lat_match and lon_match:
                 return float(lat_match.group(1)), float(lon_match.group(1))
-        except Exception as e:
-            st.warning(f"URL解析エラー: {e}")
+        except:
             return None
 
-    # パターンC: 日本語住所入力
+    # パターンC: 日本語住所入力 (単一検索用)
+    # ※一括処理で大量に呼ぶとエラーになる可能性があるが、機能自体は残しておく
     try:
         geolocator = Nominatim(user_agent="scooter_port_scorer_app")
         location = geolocator.geocode(user_input)
         if location:
-            st.success(f"住所が見つかりました: {location.address}")
             return location.latitude, location.longitude
-        else:
-            st.warning("住所が見つかりませんでした。より詳細な住所か、座標を入力してください。")
-            return None
-    except Exception as e:
-        st.warning(f"住所検索エラー: {e}")
+    except:
         return None
 
     return None
@@ -86,15 +94,14 @@ def assess_visibility_rank_v2(lat, lon):
         stations = ox.features.features_from_point((lat, lon), tags_station, dist=240)
         if not stations.empty:
             score += 3
-            details.append("✅ **駅徒歩3分圏内** (+3.0点) - ラストワンマイル需要あり")
+            details.append("✅ 駅徒歩3分圏内 (+3.0)")
         else:
-            details.append("・ 駅遠 (0点)")
+            details.append("・ 駅遠 (0)")
     except:
         pass
 
     # --- Check 2: 道路の種類 (改良版) ---
     try:
-        # まずは全ての種類の道で最寄りを検索（歩道含む）
         G_all = ox.graph_from_point((lat, lon), dist=100, network_type='all')
         u, v, key = ox.distance.nearest_edges(G_all, lon, lat)
         edge_data = G_all.get_edge_data(u, v)[key]
@@ -102,137 +109,192 @@ def assess_visibility_rank_v2(lat, lon):
         highway = edge_data.get('highway', 'unknown')
         if isinstance(highway, list): highway = highway[0]
 
-        # 判定用リスト
         major_roads = ['motorway', 'trunk', 'primary', 'secondary']
         medium_roads = ['tertiary']
         living_roads = ['residential', 'unclassified', 'living_street']
         non_vehicle = ['pedestrian', 'footway', 'path', 'steps', 'cycleway']
 
-        # 【改良ポイント】もし最寄りが「歩道」だったら、近くに「車道」がないか再チェックする
-        final_highway = highway # デフォルトはそのまま
+        # 歩道救済ロジック
+        final_highway = highway
         is_sidewalk_of_major = False
 
         if highway in non_vehicle:
             try:
-                # 車道ネットワークだけで再検索 (範囲50m)
                 G_drive = ox.graph_from_point((lat, lon), dist=50, network_type='drive')
                 u_d, v_d, key_d = ox.distance.nearest_edges(G_drive, lon, lat)
-                
-                # 距離計算 (簡易的にノード間距離などで判定、あるいはnearest_edgesの戻り値を使う手もあるが、ここでは存在チェックのみ)
-                # 車道の情報を取得
                 edge_data_drive = G_drive.get_edge_data(u_d, v_d)[key_d]
                 highway_drive = edge_data_drive.get('highway', 'unknown')
                 if isinstance(highway_drive, list): highway_drive = highway_drive[0]
 
-                # もし近くに幹線道路があれば、評価をそちらにアップグレード
                 if highway_drive in major_roads or highway_drive in medium_roads:
                     final_highway = highway_drive
                     is_sidewalk_of_major = True
-                    details.append(f"ℹ️ 歩道上ですが、すぐ横に **{final_highway}** を検知しました。")
+                    details.append(f"ℹ️ 歩道上ですが横に{final_highway}を検知")
             except:
-                pass # 近くに車道がなければ歩道判定のまま
+                pass
 
-        # スコアリング (判定には final_highway を使用)
         if final_highway in major_roads:
             score += 2
-            details.append(f"✅ **幹線道路沿い** (種別: {final_highway}) (+2.0点) - 視認性「高」")
+            details.append(f"✅ 幹線道路沿い({final_highway}) (+2.0)")
         elif final_highway in medium_roads:
             score += 1
-            details.append(f"✅ **一般道・バス通り** (種別: {final_highway}) (+1.0点) - 視認性「中」")
+            details.append(f"✅ バス通り({final_highway}) (+1.0)")
         elif final_highway in living_roads:
             score += 0.5
-            details.append(f"🏠 **住宅街・生活道路** (種別: {final_highway}) (+0.5点) - 視認性「低(住民のみ)」")
-        elif highway in ['service']: # 元のhighway判定を使う（敷地内は敷地内）
-            service_detail = edge_data.get('service', '')
-            details.append(f"⚠️ **敷地内通路・私道** (種別: {highway}/{service_detail}) (0点) - 発見困難")
+            details.append(f"🏠 生活道路({final_highway}) (+0.5)")
+        elif highway in ['service']:
+            details.append(f"⚠️ 敷地内/私道 (0)")
         elif highway in non_vehicle and not is_sidewalk_of_major:
-            details.append(f"⛔️ **車両進入困難** (種別: {highway}) (判定外) - 近くに車道なし")
+            details.append(f"⛔️ 車両不可エリア({highway})")
         else:
-            details.append(f"・ その他細街路 (種別: {highway}) (0点)")
+            details.append(f"・ 細街路 (0)")
 
     except Exception as e:
-        details.append(f"⚠️ 道路データ取得失敗: {str(e)}")
+        details.append(f"⚠️ 道路データエラー")
 
-    # --- Check 3: 交差点判定 (範囲50m) ---
+    # --- Check 3: 交差点判定 ---
     try:
         G_simple = ox.graph_from_point((lat, lon), dist=50, network_type='drive', simplify=True)
         nearest_node = ox.distance.nearest_nodes(G_simple, lon, lat)
         degree = G_simple.degree[nearest_node]
         if degree >= 3:
             score += 1
-            details.append(f"✅ **交差点/角地** (接続数:{degree}) (+1.0点) - 信号待ち等の注目あり")
-        else:
-            details.append("・ 単路 (交差点ではない) (0点)")
+            details.append(f"✅ 交差点/角地 (+1.0)")
     except:
         pass
 
-    # 総合ランク判定
+    # ランク判定
     if score >= 4:
-        rank = "S (極めて高い)"
+        rank = "S"
         color = "green"
-        comment = "駅前の大通りなど、最強の立地です。"
     elif score >= 3:
-        rank = "A (高い)"
+        rank = "A"
         color = "blue"
-        comment = "駅近の裏道、または大通りの交差点など、優良物件です。"
     elif score >= 1.5:
-        rank = "B (普通)"
+        rank = "B"
         color = "orange"
-        comment = "大通り沿い、または生活道路の角地など。一定の需要は見込めます。"
     elif score > 0:
-        rank = "C (低い - 生活道路)"
+        rank = "C"
         color = "orange"
-        comment = "住宅街の中など。アプリ検索経由の利用がメインになります。"
     else:
-        rank = "D (極めて低い - 敷地内/孤立)"
+        rank = "D"
         color = "red"
-        comment = "駅から遠く、かつ私道や奥まった場所。発見される可能性は低いです。"
 
-    return rank, score, details, color, comment
+    detail_str = " / ".join(details)
+    return rank, score, detail_str, color
 
 # -------------------------------------------
-# 4. UI部分 (Streamlit)
+# 4. UI部分 (タブ構成)
 # -------------------------------------------
 st.title("🛴 ポート視認性・需要判定AI")
-st.markdown("""
-以下のいずれかを入力して、ポート候補地のポテンシャルを診断します。
-* **Google Map URL** (短縮URLも可)
-* **緯度, 経度** (例: 35.611, 140.113)
-* **住所** (例: 千葉県千葉市中央区...)
-""")
 
-user_input = st.text_input(
-    "場所の情報を入力", 
-    placeholder="https://support.google.com/maps/answer/18539?hl=ja&co=GENIE.Platform%3DDesktop2... または 住所、座標"
-)
+tab1, tab2 = st.tabs(["📍 単一検索", "📂 一括判定(CSV)"])
 
-if st.button("判定開始", type="primary"):
-    if not user_input:
-        st.error("入力してください")
-    else:
-        coords = extract_coords_from_input(user_input)
-        
-        if coords:
-            lat, lon = coords
-            
-            st.markdown("### 📍 判定場所")
-            df_map = pd.DataFrame({'lat': [lat], 'lon': [lon]})
-            st.map(df_map, zoom=15)
+# --- タブ1: 単一検索モード ---
+with tab1:
+    st.markdown("GoogleマップのURL、座標、または住所を入力してください。")
+    user_input = st.text_input("場所の情報を入力", placeholder="URL / 座標 / 住所", key="single_input")
 
-            with st.spinner('地図データを解析中...（10〜20秒ほどかかります）'):
-                rank, score, details, color, comment = assess_visibility_rank_v2(lat, lon)
-
-            st.divider()
-            st.subheader("診断結果")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(f"総合ランク: :{color}[**{rank}**]")
-            with col2:
-                st.metric("視認性スコア", f"{score} / 6.0")
-            
-            st.info(comment)
-            with st.expander("詳細な理由を見る（内訳）", expanded=True):
-                for item in details:
-                    st.markdown(item)
+    if st.button("判定開始", type="primary", key="single_btn"):
+        if not user_input:
+            st.error("入力してください")
         else:
-            st.error("場所を特定できませんでした。正しいURL、座標、または住所を入力してください。")
+            coords = extract_coords_from_input(user_input)
+            if coords:
+                lat, lon = coords
+                st.markdown("### 📍 判定場所")
+                df_map = pd.DataFrame({'lat': [lat], 'lon': [lon]})
+                st.map(df_map, zoom=15)
+
+                with st.spinner('AI分析中...'):
+                    rank, score, detail_str, color = assess_visibility_rank_v2(lat, lon)
+
+                st.divider()
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(f"総合ランク: :{color}[**{rank}**]")
+                with col2:
+                    st.metric("視認性スコア", f"{score} / 6.0")
+                
+                st.info(f"【判定理由】 {detail_str}")
+            else:
+                st.error("場所を特定できませんでした。")
+
+# --- タブ2: 一括判定モード ---
+with tab2:
+    st.markdown("""
+    **CSVファイルをアップロードしてください。**
+    
+    ✅ **推奨データ形式:**
+    * **GoogleマップのURL** (短縮URL可)
+    * **座標** (例: `35.611, 140.113`)
+    
+    ※ 日本語住所での一括検索は、通信エラーになりやすいため非推奨です。
+    """)
+    
+    uploaded_file = st.file_uploader("CSVファイルをドラッグ&ドロップ", type="csv")
+
+    if uploaded_file:
+        df = pd.read_csv(uploaded_file)
+        st.dataframe(df.head(3))
+
+        target_col = st.selectbox(
+            "📍 座標またはURLが入っている列を選んでください",
+            df.columns
+        )
+
+        if st.button("一括判定を実行 (時間がかかります)", type="primary"):
+            results_rank = []
+            results_score = []
+            results_detail = []
+            results_lat = []
+            results_lon = []
+
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            total = len(df)
+            
+            for i, row in df.iterrows():
+                progress = (i + 1) / total
+                progress_bar.progress(progress)
+                status_text.text(f"分析中... {i+1} / {total} 件目")
+
+                raw_input = str(row[target_col])
+                coords = extract_coords_from_input(raw_input)
+
+                if coords:
+                    lat, lon = coords
+                    rank, score, detail, _ = assess_visibility_rank_v2(lat, lon)
+                    
+                    results_rank.append(rank)
+                    results_score.append(score)
+                    results_detail.append(detail)
+                    results_lat.append(lat)
+                    results_lon.append(lon)
+                else:
+                    results_rank.append("エラー")
+                    results_score.append(0)
+                    results_detail.append("座標取得失敗")
+                    results_lat.append(None)
+                    results_lon.append(None)
+                
+                time.sleep(0.1)
+
+            df["AIランク"] = results_rank
+            df["AIスコア"] = results_score
+            df["AI判定理由"] = results_detail
+            df["緯度"] = results_lat
+            df["経度"] = results_lon
+
+            st.success("✅ 全件の分析が完了しました！")
+            st.dataframe(df)
+
+            csv = df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="結果CSVをダウンロード",
+                data=csv,
+                file_name="scooter_ai_results.csv",
+                mime="text/csv",
+            )
+```
