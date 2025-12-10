@@ -4,6 +4,7 @@ import pandas as pd
 import re
 import requests
 import time
+import concurrent.futures
 from urllib.parse import urlparse, parse_qs
 from geopy.geocoders import Nominatim
 
@@ -58,7 +59,7 @@ def extract_coords_from_input(user_input):
         except:
             return None
 
-    # パターンC: 日本語住所入力 (単一検索用)
+    # パターンC: 日本語住所入力
     try:
         geolocator = Nominatim(user_agent="scooter_port_scorer_app")
         location = geolocator.geocode(user_input)
@@ -174,7 +175,41 @@ def assess_visibility_rank_v2(lat, lon):
     return rank, score, detail_str, color
 
 # -------------------------------------------
-# 4. UI部分 (タブ構成)
+# 4. ヘルパー関数: 1行分の処理 (並列実行用)
+# -------------------------------------------
+def process_single_row(row_data):
+    """
+    DataFrameの1行(Series)を受け取り、判定結果を辞書で返す
+    """
+    index, row, target_col = row_data
+    raw_input = str(row[target_col])
+    coords = extract_coords_from_input(raw_input)
+
+    result = {
+        "index": index,
+        "AIランク": "エラー",
+        "AIスコア": 0,
+        "AI判定理由": "座標取得失敗",
+        "緯度": None,
+        "経度": None
+    }
+
+    if coords:
+        lat, lon = coords
+        try:
+            rank, score, detail, _ = assess_visibility_rank_v2(lat, lon)
+            result["AIランク"] = rank
+            result["AIスコア"] = score
+            result["AI判定理由"] = detail
+            result["緯度"] = lat
+            result["経度"] = lon
+        except:
+            result["AI判定理由"] = "分析エラー"
+    
+    return result
+
+# -------------------------------------------
+# 5. UI部分
 # -------------------------------------------
 st.title("🛴 ポート視認性・需要判定AI")
 
@@ -210,7 +245,7 @@ with tab1:
             else:
                 st.error("場所を特定できませんでした。")
 
-# --- タブ2: 一括判定モード ---
+# --- タブ2: 一括判定モード (高速化版) ---
 with tab2:
     st.markdown("""
     **CSVファイルをアップロードしてください。**
@@ -219,7 +254,7 @@ with tab2:
     * **GoogleマップのURL** (短縮URL可)
     * **座標** (例: `35.611, 140.113`)
     
-    ※ 日本語住所での一括検索は、通信エラーになりやすいため非推奨です。
+    ※ 最大5並列で高速処理します。
     """)
     
     uploaded_file = st.file_uploader("CSVファイルをドラッグ&ドロップ", type="csv")
@@ -233,57 +268,49 @@ with tab2:
             df.columns
         )
 
-        if st.button("一括判定を実行 (時間がかかります)", type="primary"):
-            results_rank = []
-            results_score = []
-            results_detail = []
-            results_lat = []
-            results_lon = []
-
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        if st.button("一括判定を実行 (高速モード)", type="primary"):
+            st.info("分析を開始します。そのままお待ちください...")
             
+            # 結果格納用辞書
+            results = {}
             total = len(df)
             
-            for i, row in df.iterrows():
-                progress = (i + 1) / total
-                progress_bar.progress(progress)
-                status_text.text(f"分析中... {i+1} / {total} 件目")
+            # プログレスバー
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-                raw_input = str(row[target_col])
-                coords = extract_coords_from_input(raw_input)
-
-                if coords:
-                    lat, lon = coords
-                    rank, score, detail, _ = assess_visibility_rank_v2(lat, lon)
-                    
-                    results_rank.append(rank)
-                    results_score.append(score)
-                    results_detail.append(detail)
-                    results_lat.append(lat)
-                    results_lon.append(lon)
-                else:
-                    results_rank.append("エラー")
-                    results_score.append(0)
-                    results_detail.append("座標取得失敗")
-                    results_lat.append(None)
-                    results_lon.append(None)
+            # 並列処理の実行 (max_workers=5)
+            # 5並列ならサーバー制限にかかりにくく、かつ高速
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                # タスクの作成: (index, row, target_col) のタプルを渡す
+                tasks = [executor.submit(process_single_row, (i, row, target_col)) for i, row in df.iterrows()]
                 
-                time.sleep(0.1)
+                # 完了したものから順次処理
+                for i, future in enumerate(concurrent.futures.as_completed(tasks)):
+                    res = future.result()
+                    results[res["index"]] = res
+                    
+                    # 進捗更新
+                    progress = (i + 1) / total
+                    progress_bar.progress(progress)
+                    status_text.text(f"分析中... {i+1} / {total} 件完了")
 
-            df["AIランク"] = results_rank
-            df["AIスコア"] = results_score
-            df["AI判定理由"] = results_detail
-            df["緯度"] = results_lat
-            df["経度"] = results_lon
+            # 結果をDataFrameに反映 (インデックス順に整列)
+            results_list = [results[i] for i in range(total)]
+            
+            df["AIランク"] = [r["AIランク"] for r in results_list]
+            df["AIスコア"] = [r["AIスコア"] for r in results_list]
+            df["AI判定理由"] = [r["AI判定理由"] for r in results_list]
+            df["緯度"] = [r["緯度"] for r in results_list]
+            df["経度"] = [r["経度"] for r in results_list]
 
-            st.success("✅ 全件の分析が完了しました！")
+            st.success(f"✅ {total}件の分析が完了しました！")
             st.dataframe(df)
 
             csv = df.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
                 label="結果CSVをダウンロード",
                 data=csv,
-                file_name="scooter_ai_results.csv",
+                file_name="scooter_ai_results_fast.csv",
                 mime="text/csv",
             )
